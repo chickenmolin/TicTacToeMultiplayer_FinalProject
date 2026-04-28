@@ -7,430 +7,326 @@ using Unity.Services.Lobbies.Models;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
+// 1. Công dụng file:
+// - Quản lý toàn bộ hệ thống Lobby (Unity Services)
+// - Xử lý tạo, join, rời lobby
+// - Đồng bộ dữ liệu giữa các player
+// - Điều khiển start game và chuyển scene
+
+// 2. Các mục quan trọng:
+
+// a) Dữ liệu chính:
+// - Instance: singleton để truy cập toàn cục
+// - joinedLobby: lobby hiện tại đang tham gia
+// - playerName: tên người chơi
+// - IsHost: xác định player có phải host không
+// - RelayJoinCode: mã kết nối relay để vào game
+// - alreadyStartedGame: trạng thái đã bắt đầu game
+
+// b) Key dữ liệu lobby:
+// - KEY_PLAYER_NAME: tên player
+// - KEY_PLAYER_CHARACTER: nhân vật player
+// - KEY_GAME_MODE: chế độ chơi
+// - KEY_START_GAME: trạng thái bắt đầu game
+// - KEY_RELAY_JOIN_CODE: mã relay
+
+// c) Event:
+// - OnJoinedLobby: khi join lobby
+// - OnJoinedLobbyUpdate: khi lobby update
+// - OnLeftLobby: khi rời lobby
+// - OnKickedFromLobby: khi bị kick
+// - OnLobbyGameModeChanged: khi đổi game mode
+// - OnLobbyStartGame: khi bắt đầu game
+// - OnLobbyListChanged: khi danh sách lobby thay đổi
+
+// d) Lobby lifecycle:
+// - Authenticate():
+//   + Đăng nhập Unity Services
+//   + Lưu playerName
+// - CreateLobby():
+//   + Tạo lobby mới
+// - JoinLobby() / JoinLobbyByCode():
+//   + Tham gia lobby
+// - LeaveLobby():
+//   + Rời lobby
+// - QuickJoinLobby():
+//   + Join nhanh lobby bất kỳ
+
+// e) Player data:
+// - GetPlayer():
+//   + Tạo Player object với name + character
+// - UpdatePlayerName():
+//   + Cập nhật tên player lên lobby
+// - UpdatePlayerCharacter():
+//   + Cập nhật nhân vật player
+
+// f) Lobby data:
+// - ChangeGameMode():
+//   + Chuyển đổi game mode
+// - UpdateLobbyGameMode():
+//   + Sync game mode lên lobby
+
+// g) Lobby system:
+// - HandleLobbyHeartbeat():
+//   + Host gửi ping để giữ lobby alive
+// - HandleLobbyPolling():
+//   + Poll dữ liệu lobby liên tục
+//   + Cập nhật state lobby
+//   + Detect bị kick
+//   + Trigger start game khi đủ player
+
+// h) Lobby list:
+// - RefreshLobbyList():
+//   + Lấy danh sách lobby từ server
+//   + Trigger event update UI
+
+// i) Game flow:
+// - StartGame():
+//   + Host set trạng thái start game
+//   + Load scene game
+// - JoinGame():
+//   + Client join game qua relay code
+//   + Load scene game
+
+// j) Relay:
+// - SetRelayJoinCode():
+//   + Lưu relay code vào lobby để client join
+
+// k) Dependencies:
+// - Unity Services (Authentication, Lobby, Relay)
+// - SceneManager: load scene game
+// - Lobby / Player (Unity Services): dữ liệu lobby
+
 public class LobbyManager : MonoBehaviour {
-
-
     public static LobbyManager Instance { get; private set; }
-
-
     public static bool IsHost { get; private set; }
     public static string RelayJoinCode { get; private set; }
 
-
-
-    public const string KEY_PLAYER_NAME = "PlayerName";
+    // === KEYS lưu dữ liệu lên Unity Lobby Service ===
+    public const string KEY_PLAYER_NAME      = "PlayerName";
     public const string KEY_PLAYER_CHARACTER = "Character";
-    public const string KEY_GAME_MODE = "GameMode";
-    public const string KEY_START_GAME = "StartGame";
-    public const string KEY_RELAY_JOIN_CODE = "RelayJoinCode";
+    public const string KEY_GAME_MODE        = "GameMode";
+    public const string KEY_START_GAME       = "StartGame";
+    public const string KEY_RELAY_JOIN_CODE  = "RelayJoinCode";
 
-
-
+    // === EVENTS thông báo trạng thái lobby ===
     public event EventHandler OnLeftLobby;
-
     public event EventHandler<LobbyEventArgs> OnJoinedLobby;
-    public event EventHandler<LobbyEventArgs> OnJoinedLobbyUpdate;
+    public event EventHandler<LobbyEventArgs> OnJoinedLobbyUpdate;   // Lobby có thay đổi
     public event EventHandler<LobbyEventArgs> OnKickedFromLobby;
     public event EventHandler<LobbyEventArgs> OnLobbyGameModeChanged;
     public event EventHandler<LobbyEventArgs> OnLobbyStartGame;
-    public class LobbyEventArgs : EventArgs {
-        public Lobby lobby;
-    }
-
     public event EventHandler<OnLobbyListChangedEventArgs> OnLobbyListChanged;
-    public class OnLobbyListChangedEventArgs : EventArgs {
-        public List<Lobby> lobbyList;
-    }
 
-
-    public enum GameMode {
-        CaptureTheFlag,
-        Conquest
-    }
-
-    public enum PlayerCharacter {
-        Marine,
-        Ninja,
-        Zombie
-    }
-
-
+    public enum GameMode { CaptureTheFlag, Conquest }
+    public enum PlayerCharacter { Marine, Ninja, Zombie }
 
     private float heartbeatTimer;
     private float lobbyPollTimer;
-    private float refreshLobbyListTimer = 5f;
     private Lobby joinedLobby;
     private string playerName;
     private bool alreadyStartedGame;
 
-
-    private void Awake() {
-        Instance = this;
-    }
-
     private void Update() {
-        //HandleRefreshLobbyList(); // Disabled Auto Refresh for testing with multiple builds
-        HandleLobbyHeartbeat();
-        HandleLobbyPolling();
+        HandleLobbyHeartbeat(); // Giữ lobby không bị xóa tự động
+        HandleLobbyPolling();   // Cập nhật trạng thái lobby định kỳ
     }
 
+    // Đăng nhập ẩn danh với Unity Services
     public async void Authenticate(string playerName) {
-        playerName = playerName.Replace(" ", "_");
-        this.playerName = playerName;
-        InitializationOptions initializationOptions = new InitializationOptions();
-        initializationOptions.SetProfile(playerName);
-
-        await UnityServices.InitializeAsync(initializationOptions);
-
-        AuthenticationService.Instance.SignedIn += () => {
-            // do nothing
-            Debug.Log("Signed in! " + AuthenticationService.Instance.PlayerId);
-
-            RefreshLobbyList();
-        };
-
+        this.playerName = playerName.Replace(" ", "_");
+        InitializationOptions options = new InitializationOptions();
+        options.SetProfile(playerName);
+        await UnityServices.InitializeAsync(options);
+        AuthenticationService.Instance.SignedIn += () => RefreshLobbyList();
         await AuthenticationService.Instance.SignInAnonymouslyAsync();
     }
 
-    private void HandleRefreshLobbyList() {
-        if (UnityServices.State == ServicesInitializationState.Initialized && AuthenticationService.Instance.IsSignedIn) {
-            refreshLobbyListTimer -= Time.deltaTime;
-            if (refreshLobbyListTimer < 0f) {
-                float refreshLobbyListTimerMax = 5f;
-                refreshLobbyListTimer = refreshLobbyListTimerMax;
-
-                RefreshLobbyList();
-            }
-        }
-    }
-
+    // Host gửi heartbeat mỗi 15s để lobby không bị xóa
     private async void HandleLobbyHeartbeat() {
         if (IsLobbyHost()) {
             heartbeatTimer -= Time.deltaTime;
             if (heartbeatTimer < 0f) {
-                float heartbeatTimerMax = 15f;
-                heartbeatTimer = heartbeatTimerMax;
-
-                Debug.Log("Heartbeat");
+                heartbeatTimer = 15f;
                 await LobbyService.Instance.SendHeartbeatPingAsync(joinedLobby.Id);
             }
         }
     }
 
+    // Poll lobby mỗi 1.1s để đồng bộ trạng thái
     private async void HandleLobbyPolling() {
         if (joinedLobby != null) {
             lobbyPollTimer -= Time.deltaTime;
             if (lobbyPollTimer < 0f) {
-                float lobbyPollTimerMax = 1.1f;
-                lobbyPollTimer = lobbyPollTimerMax;
-
+                lobbyPollTimer = 1.1f;
                 joinedLobby = await LobbyService.Instance.GetLobbyAsync(joinedLobby.Id);
-
                 OnJoinedLobbyUpdate?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
 
-                if (!IsLobbyHost()) {
-                    if (joinedLobby.Data[KEY_RELAY_JOIN_CODE].Value != "") {
-                        JoinGame(joinedLobby.Data[KEY_RELAY_JOIN_CODE].Value);
-                    }
-                }
+                // Client nhận relay code → vào game
+                if (!IsLobbyHost() && joinedLobby.Data[KEY_RELAY_JOIN_CODE].Value != "")
+                    JoinGame(joinedLobby.Data[KEY_RELAY_JOIN_CODE].Value);
 
-                if (!alreadyStartedGame) {
-                    if (IsLobbyHost()) {
-                        if (joinedLobby.Players.Count == 2) {
-                            // Two players have joined, start game
-                            StartGame();
-                        }
-                    }
-                }
+                // Host tự động start khi đủ 2 người
+                if (!alreadyStartedGame && IsLobbyHost() && joinedLobby.Players.Count == 2)
+                    StartGame();
 
-
+                // Bị kick khỏi lobby
                 if (!IsPlayerInLobby()) {
-                    // Player was kicked out of this lobby
-                    Debug.Log("Kicked from Lobby!");
-
                     OnKickedFromLobby?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
-
                     joinedLobby = null;
                 }
             }
         }
     }
 
-    public Lobby GetJoinedLobby() {
-        return joinedLobby;
-    }
-
-    public bool IsLobbyHost() {
-        return joinedLobby != null && joinedLobby.HostId == AuthenticationService.Instance.PlayerId;
-    }
-
-    private bool IsPlayerInLobby() {
-        if (joinedLobby != null && joinedLobby.Players != null) {
-            foreach (Player player in joinedLobby.Players) {
-                if (player.Id == AuthenticationService.Instance.PlayerId) {
-                    // This player is in this lobby
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    private Player GetPlayer() {
-        return new Player(AuthenticationService.Instance.PlayerId, null, new Dictionary<string, PlayerDataObject> {
-            { KEY_PLAYER_NAME, new PlayerDataObject(PlayerDataObject.VisibilityOptions.Public, playerName) },
+    // Tạo player object kèm tên và nhân vật mặc định
+    private Player GetPlayer() => new Player(AuthenticationService.Instance.PlayerId, null,
+        new Dictionary<string, PlayerDataObject> {
+            { KEY_PLAYER_NAME,      new PlayerDataObject(PlayerDataObject.VisibilityOptions.Public, playerName) },
             { KEY_PLAYER_CHARACTER, new PlayerDataObject(PlayerDataObject.VisibilityOptions.Public, PlayerCharacter.Marine.ToString()) }
         });
-    }
 
-    public void ChangeGameMode() {
-        if (IsLobbyHost()) {
-            GameMode gameMode =
-                Enum.Parse<GameMode>(joinedLobby.Data[KEY_GAME_MODE].Value);
-
-            switch (gameMode) {
-                default:
-                case GameMode.CaptureTheFlag:
-                    gameMode = GameMode.Conquest;
-                    break;
-                case GameMode.Conquest:
-                    gameMode = GameMode.CaptureTheFlag;
-                    break;
-            }
-
-            UpdateLobbyGameMode(gameMode);
-        }
-    }
-
+    // Tạo lobby mới với cấu hình đầy đủ
     public async void CreateLobby(string lobbyName, int maxPlayers, bool isPrivate, GameMode gameMode) {
-        Player player = GetPlayer();
-
-        CreateLobbyOptions options = new CreateLobbyOptions {
-            Player = player,
+        Lobby lobby = await LobbyService.Instance.CreateLobbyAsync(lobbyName, maxPlayers, new CreateLobbyOptions {
+            Player = GetPlayer(),
             IsPrivate = isPrivate,
             Data = new Dictionary<string, DataObject> {
-                { KEY_GAME_MODE, new DataObject(DataObject.VisibilityOptions.Public, gameMode.ToString()) },
+                { KEY_GAME_MODE,       new DataObject(DataObject.VisibilityOptions.Public, gameMode.ToString()) },
                 { KEY_RELAY_JOIN_CODE, new DataObject(DataObject.VisibilityOptions.Member, "") }
             }
-        };
-
-        Lobby lobby = await LobbyService.Instance.CreateLobbyAsync(lobbyName, maxPlayers, options);
-
+        });
         joinedLobby = lobby;
-
         OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
-
-        Debug.Log("Created Lobby " + lobby.Name);
     }
 
+    // Lấy danh sách lobby còn chỗ trống, mới nhất trước
     public async void RefreshLobbyList() {
         try {
-            QueryLobbiesOptions options = new QueryLobbiesOptions();
-            options.Count = 25;
-
-            // Filter for open lobbies only
-            options.Filters = new List<QueryFilter> {
-                new QueryFilter(
-                    field: QueryFilter.FieldOptions.AvailableSlots,
-                    op: QueryFilter.OpOptions.GT,
-                    value: "0")
-            };
-
-            // Order by newest lobbies first
-            options.Order = new List<QueryOrder> {
-                new QueryOrder(
-                    asc: false,
-                    field: QueryOrder.FieldOptions.Created)
-            };
-
-            QueryResponse lobbyListQueryResponse = await Lobbies.Instance.QueryLobbiesAsync();
-
-            OnLobbyListChanged?.Invoke(this, new OnLobbyListChangedEventArgs { lobbyList = lobbyListQueryResponse.Results });
-        } catch (LobbyServiceException e) {
-            Debug.Log(e);
-        }
-    }
-
-    public async void JoinLobbyByCode(string lobbyCode) {
-        Player player = GetPlayer();
-
-        Lobby lobby = await LobbyService.Instance.JoinLobbyByCodeAsync(lobbyCode, new JoinLobbyByCodeOptions {
-            Player = player
-        });
-
-        joinedLobby = lobby;
-
-        OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
+            QueryResponse response = await Lobbies.Instance.QueryLobbiesAsync();
+            OnLobbyListChanged?.Invoke(this, new OnLobbyListChangedEventArgs { lobbyList = response.Results });
+        } catch (LobbyServiceException e) { Debug.Log(e); }
     }
 
     public async void JoinLobby(Lobby lobby) {
-        Player player = GetPlayer();
-
-        joinedLobby = await LobbyService.Instance.JoinLobbyByIdAsync(lobby.Id, new JoinLobbyByIdOptions {
-            Player = player
-        });
-
+        joinedLobby = await LobbyService.Instance.JoinLobbyByIdAsync(lobby.Id,
+            new JoinLobbyByIdOptions { Player = GetPlayer() });
         OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
     }
 
-    public async void UpdatePlayerName(string playerName) {
-        this.playerName = playerName;
-
-        if (joinedLobby != null) {
-            try {
-                UpdatePlayerOptions options = new UpdatePlayerOptions();
-
-                options.Data = new Dictionary<string, PlayerDataObject>() {
-                    {
-                        KEY_PLAYER_NAME, new PlayerDataObject(
-                            visibility: PlayerDataObject.VisibilityOptions.Public,
-                            value: playerName)
-                    }
-                };
-
-                string playerId = AuthenticationService.Instance.PlayerId;
-
-                Lobby lobby = await LobbyService.Instance.UpdatePlayerAsync(joinedLobby.Id, playerId, options);
-                joinedLobby = lobby;
-
-                OnJoinedLobbyUpdate?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
-            } catch (LobbyServiceException e) {
-                Debug.Log(e);
-            }
-        }
-    }
-
-    public async void UpdatePlayerCharacter(PlayerCharacter playerCharacter) {
-        if (joinedLobby != null) {
-            try {
-                UpdatePlayerOptions options = new UpdatePlayerOptions();
-
-                options.Data = new Dictionary<string, PlayerDataObject>() {
-                    {
-                        KEY_PLAYER_CHARACTER, new PlayerDataObject(
-                            visibility: PlayerDataObject.VisibilityOptions.Public,
-                            value: playerCharacter.ToString())
-                    }
-                };
-
-                string playerId = AuthenticationService.Instance.PlayerId;
-
-                Lobby lobby = await LobbyService.Instance.UpdatePlayerAsync(joinedLobby.Id, playerId, options);
-                joinedLobby = lobby;
-
-                OnJoinedLobbyUpdate?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
-            } catch (LobbyServiceException e) {
-                Debug.Log(e);
-            }
-        }
+    public async void JoinLobbyByCode(string lobbyCode) {
+        joinedLobby = await LobbyService.Instance.JoinLobbyByCodeAsync(lobbyCode,
+            new JoinLobbyByCodeOptions { Player = GetPlayer() });
+        OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
     }
 
     public async void QuickJoinLobby() {
         try {
-            QuickJoinLobbyOptions options = new QuickJoinLobbyOptions();
+            joinedLobby = await LobbyService.Instance.QuickJoinLobbyAsync(new QuickJoinLobbyOptions());
+            OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
+        } catch (LobbyServiceException e) { Debug.Log(e); }
+    }
 
-            Lobby lobby = await LobbyService.Instance.QuickJoinLobbyAsync(options);
-            joinedLobby = lobby;
+    // Cập nhật tên người chơi lên server
+    public async void UpdatePlayerName(string playerName) {
+        this.playerName = playerName;
+        if (joinedLobby == null) return;
+        try {
+            joinedLobby = await LobbyService.Instance.UpdatePlayerAsync(joinedLobby.Id,
+                AuthenticationService.Instance.PlayerId, new UpdatePlayerOptions {
+                    Data = new Dictionary<string, PlayerDataObject> {
+                        { KEY_PLAYER_NAME, new PlayerDataObject(PlayerDataObject.VisibilityOptions.Public, playerName) }
+                    }
+                });
+            OnJoinedLobbyUpdate?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
+        } catch (LobbyServiceException e) { Debug.Log(e); }
+    }
 
-            OnJoinedLobby?.Invoke(this, new LobbyEventArgs { lobby = lobby });
-        } catch (LobbyServiceException e) {
-            Debug.Log(e);
-        }
+    // Cập nhật nhân vật người chơi lên server
+    public async void UpdatePlayerCharacter(PlayerCharacter playerCharacter) {
+        if (joinedLobby == null) return;
+        try {
+            joinedLobby = await LobbyService.Instance.UpdatePlayerAsync(joinedLobby.Id,
+                AuthenticationService.Instance.PlayerId, new UpdatePlayerOptions {
+                    Data = new Dictionary<string, PlayerDataObject> {
+                        { KEY_PLAYER_CHARACTER, new PlayerDataObject(PlayerDataObject.VisibilityOptions.Public, playerCharacter.ToString()) }
+                    }
+                });
+            OnJoinedLobbyUpdate?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
+        } catch (LobbyServiceException e) { Debug.Log(e); }
     }
 
     public async void LeaveLobby() {
-        if (joinedLobby != null) {
-            try {
-                await LobbyService.Instance.RemovePlayerAsync(joinedLobby.Id, AuthenticationService.Instance.PlayerId);
-
-                joinedLobby = null;
-
-                OnLeftLobby?.Invoke(this, EventArgs.Empty);
-            } catch (LobbyServiceException e) {
-                Debug.Log(e);
-            }
-        }
+        if (joinedLobby == null) return;
+        try {
+            await LobbyService.Instance.RemovePlayerAsync(joinedLobby.Id, AuthenticationService.Instance.PlayerId);
+            joinedLobby = null;
+            OnLeftLobby?.Invoke(this, EventArgs.Empty);
+        } catch (LobbyServiceException e) { Debug.Log(e); }
     }
 
+    // Chỉ host mới có thể kick người chơi
     public async void KickPlayer(string playerId) {
-        if (IsLobbyHost()) {
-            try {
-                await LobbyService.Instance.RemovePlayerAsync(joinedLobby.Id, playerId);
-            } catch (LobbyServiceException e) {
-                Debug.Log(e);
-            }
-        }
+        if (!IsLobbyHost()) return;
+        try {
+            await LobbyService.Instance.RemovePlayerAsync(joinedLobby.Id, playerId);
+        } catch (LobbyServiceException e) { Debug.Log(e); }
     }
 
     public async void UpdateLobbyGameMode(GameMode gameMode) {
         try {
-            Debug.Log("UpdateLobbyGameMode " + gameMode);
-            
-            Lobby lobby = await Lobbies.Instance.UpdateLobbyAsync(joinedLobby.Id, new UpdateLobbyOptions {
+            joinedLobby = await Lobbies.Instance.UpdateLobbyAsync(joinedLobby.Id, new UpdateLobbyOptions {
                 Data = new Dictionary<string, DataObject> {
                     { KEY_GAME_MODE, new DataObject(DataObject.VisibilityOptions.Public, gameMode.ToString()) }
                 }
             });
-
-            joinedLobby = lobby;
-
             OnLobbyGameModeChanged?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
-        } catch (LobbyServiceException e) {
-            Debug.Log(e);
-        }
+        } catch (LobbyServiceException e) { Debug.Log(e); }
     }
 
+    // Host start game: lưu relay code lên lobby → load scene
     public async void StartGame() {
         try {
-            Debug.Log("StartGame");
-
-            Lobby lobby = await Lobbies.Instance.UpdateLobbyAsync(joinedLobby.Id, new UpdateLobbyOptions {
+            joinedLobby = await Lobbies.Instance.UpdateLobbyAsync(joinedLobby.Id, new UpdateLobbyOptions {
                 Data = new Dictionary<string, DataObject> {
                     { KEY_START_GAME, new DataObject(DataObject.VisibilityOptions.Public, "1") }
                 }
             });
-
-            joinedLobby = lobby;
-
             IsHost = true;
             alreadyStartedGame = true;
             SceneManager.LoadScene(1);
-
             OnLobbyStartGame?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
-        } catch (LobbyServiceException e) {
-            Debug.Log(e);
-        }
+        } catch (LobbyServiceException e) { Debug.Log(e); }
     }
 
+    // Client nhận relay code và vào game
     private void JoinGame(string relayJoinCode) {
-        Debug.Log("JoinGame " + relayJoinCode);
-        if (string.IsNullOrEmpty(relayJoinCode)) {
-            Debug.Log("Invalid Relay code, wait");
-            return;
-        }
-
+        if (string.IsNullOrEmpty(relayJoinCode)) return;
         IsHost = false;
         RelayJoinCode = relayJoinCode;
-        SceneManager.LoadScene(1);
         alreadyStartedGame = true;
+        SceneManager.LoadScene(1);
         OnLobbyStartGame?.Invoke(this, new LobbyEventArgs { lobby = joinedLobby });
     }
 
+    // Host lưu relay join code để client có thể kết nối
     public async void SetRelayJoinCode(string relayJoinCode) {
         try {
-            Debug.Log("SetRelayJoinCode " + relayJoinCode);
-
-            Lobby lobby = await Lobbies.Instance.UpdateLobbyAsync(joinedLobby.Id, new UpdateLobbyOptions {
+            joinedLobby = await Lobbies.Instance.UpdateLobbyAsync(joinedLobby.Id, new UpdateLobbyOptions {
                 Data = new Dictionary<string, DataObject> {
                     { KEY_RELAY_JOIN_CODE, new DataObject(DataObject.VisibilityOptions.Member, relayJoinCode) }
                 }
             });
-
-            joinedLobby = lobby;
-        } catch (LobbyServiceException e) {
-            Debug.Log(e);
-        }
+        } catch (LobbyServiceException e) { Debug.Log(e); }
     }
 
+    public bool IsLobbyHost() => joinedLobby != null && joinedLobby.HostId == AuthenticationService.Instance.PlayerId;
+    public Lobby GetJoinedLobby() => joinedLobby;
 
+    private bool IsPlayerInLobby() {
+        if (joinedLobby?.Players == null) return false;
+        foreach (Player player in joinedLobby.Players)
+            if (player.Id == AuthenticationService.Instance.PlayerId) return true;
+        return false;
+    }
 }
