@@ -1,31 +1,25 @@
 using UnityEngine;
 
 public class SoundManager : MonoBehaviour {
-
-
-    [SerializeField] private Transform placeSfxPrefab;
-    [SerializeField] private Transform winSfxPrefab;
-    [SerializeField] private Transform loseSfxPrefab;
-
+    [SerializeField] private Transform placeSfxPrefab; // Âm thanh đặt quân
+    [SerializeField] private Transform winSfxPrefab;   // Âm thanh thắng
+    [SerializeField] private Transform loseSfxPrefab;  // Âm thanh thua
 
     private void Start() {
         GameManager.Instance.OnPlacedObject += GameManager_OnPlacedObject;
-        GameManager.Instance.OnGameWin += GameManager_OnGameWin;
+        GameManager.Instance.OnGameWin      += GameManager_OnGameWin;
     }
 
+    // Phát âm thắng hoặc thua tùy người chơi local
     private void GameManager_OnGameWin(object sender, GameManager.OnGameWinEventArgs e) {
-        if (GameManager.Instance.GetLocalPlayerType() == e.winPlayerType) {
-            Transform sfxTransform = Instantiate(winSfxPrefab);
-            Destroy(sfxTransform.gameObject, 5f);
-        } else {
-            Transform sfxTransform = Instantiate(loseSfxPrefab);
-            Destroy(sfxTransform.gameObject, 5f);
-        }
+        bool isLocalWin = GameManager.Instance.GetLocalPlayerType() == e.winPlayerType;
+        Transform sfx = Instantiate(isLocalWin ? winSfxPrefab : loseSfxPrefab);
+        Destroy(sfx.gameObject, 5f); // Tự xóa sau 5s
     }
 
+    // Phát âm khi đặt quân
     private void GameManager_OnPlacedObject(object sender, System.EventArgs e) {
-        Transform sfxTransform = Instantiate(placeSfxPrefab);
-        Destroy(sfxTransform.gameObject, 5f);
+        Transform sfx = Instantiate(placeSfxPrefab);
+        Destroy(sfx.gameObject, 5f);
     }
-
 }
